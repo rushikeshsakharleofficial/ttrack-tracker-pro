@@ -1,0 +1,4 @@
+/target
+/*.cast
+*.log
+.DS_Store
