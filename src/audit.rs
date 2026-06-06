@@ -2,7 +2,7 @@ use crate::cast::{read_event, read_header};
 use crate::config::Config;
 use crate::store;
 use anyhow::{Context, Result};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, BufReader, Cursor, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -152,6 +152,7 @@ pub fn prune(cfg: &Config, yes: bool) -> Result<()> {
     let mut count = 0usize;
     for user in store::users(cfg)? {
         for path in store::user_sessions(cfg, &user)? {
+            eprintln!("ttrack: prune: deleting {}", path.display());
             fs::remove_file(&path)?;
             count += 1;
         }

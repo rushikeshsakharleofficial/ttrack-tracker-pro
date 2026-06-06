@@ -1,4 +1,5 @@
 use crate::cast::{read_event, read_header};
+use zeroize::Zeroizing;
 use crate::config::Config;
 use crate::crypto;
 use anyhow::{Context, Result};
@@ -71,8 +72,8 @@ pub fn find_central(cfg: &Config, id: &str) -> Result<(PathBuf, String)> {
 
 pub fn read_plain_cast(path: &Path, cfg: &Config) -> Result<Vec<u8>> {
     let data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    if data.starts_with(crypto::MAGIC) {
-        let key = fs::read(&cfg.key_file).with_context(|| format!("read key {}", cfg.key_file.display()))?;
+    if crypto::is_encrypted(&data) {
+        let key = Zeroizing::new(fs::read(&cfg.key_file).with_context(|| format!("read key {}", cfg.key_file.display()))?);
         let mut out = Vec::new();
         crypto::decrypt_stream(Cursor::new(data), &mut out, &key)?;
         Ok(out)
