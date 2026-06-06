@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{BufReader, Cursor};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use libc;
 
 pub fn local_dir(cfg: &Config) -> PathBuf {
     cfg.local_dir.clone()
@@ -157,9 +158,21 @@ pub fn print_session_row(path: &Path, display_name: &str, cfg: &Config) -> Resul
         .and_then(|h| Local.timestamp_opt(h.timestamp, 0).single())
         .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_else(|| "?".to_string());
-    let command = header.map(|h| h.command).unwrap_or_else(|| "(unreadable)".to_string());
-    let dur = duration_from_data(&data).unwrap_or_else(|_| "-".to_string());
-    println!("{:<8} {:<29} {:<20} {:<10} {}", "SAVED", display_name, started, dur, command);
+    let command = header.as_ref().map(|h| h.command.clone()).unwrap_or_else(|| "(unreadable)".to_string());
+    let active = is_active(path);
+    let (status, dur) = if active {
+        let elapsed = header.as_ref().and_then(|h| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            Some(human_duration(now.saturating_sub(h.timestamp as u64) as f64))
+        }).unwrap_or_else(|| "-".to_string());
+        ("ACTIVE".to_string(), elapsed)
+    } else {
+        ("SAVED".to_string(), duration_from_data(&data).unwrap_or_else(|_| "-".to_string()))
+    };
+    println!("{:<8} {:<29} {:<20} {:<10} {}", status, display_name, started, dur, command);
     Ok(())
 }
 
@@ -176,6 +189,84 @@ fn duration_from_data(data: &[u8]) -> Result<String> {
         last = ev.0;
     }
     Ok(human_duration(last))
+}
+
+pub fn header(path: &Path, cfg: &Config) -> Result<crate::cast::Header> {
+    let data = read_plain_cast(path, cfg)?;
+    let mut br = BufReader::new(Cursor::new(data));
+    read_header(&mut br)
+}
+
+pub fn ansible_runs(cfg: &Config, user: &str) -> Result<Vec<String>> {
+    let dir = cfg.central_dir.join(user).join("ansible");
+    let mut out = Vec::new();
+    if !dir.exists() {
+        return Ok(out);
+    }
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().map(|x| x == "ajsonl").unwrap_or(false) {
+            if let Some(stem) = path.file_stem() {
+                out.push(stem.to_string_lossy().to_string());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+#[cfg(target_os = "linux")]
+fn boot_time() -> Option<u64> {
+    let data = fs::read_to_string("/proc/stat").ok()?;
+    for line in data.lines() {
+        if let Some(rest) = line.strip_prefix("btime ") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn proc_start_time(pid: u32) -> Option<u64> {
+    let data = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = data.rfind(')')?;
+    let rest = &data[close + 1..];
+    rest.split_whitespace().nth(19).and_then(|s| s.parse().ok())
+}
+
+#[cfg(target_os = "linux")]
+pub fn is_active(path: &Path) -> bool {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let pid_str = match stem.rsplit_once('-') {
+        Some((_, p)) => p,
+        None => return false,
+    };
+    let pid: u32 = match pid_str.parse() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+    if comm.trim() != "ttrack" {
+        return false;
+    }
+    let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+    if clk_tck == 0 {
+        return false;
+    }
+    let Some(btime) = boot_time() else { return false };
+    let Some(starttime) = proc_start_time(pid) else { return false };
+    let proc_start = btime + starttime / clk_tck;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.abs_diff(proc_start) < 5
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_active(_: &Path) -> bool {
+    false
 }
 
 fn human_duration(secs: f64) -> String {

@@ -5,7 +5,8 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::io::{self, BufReader, Cursor, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 pub fn play(cfg: &Config, target: &str, speed: f64) -> Result<()> {
     let hash_path = crate::auth::playback_hash_path(&cfg.central_dir);
@@ -111,44 +112,100 @@ pub fn tail_static(cfg: &Config, id: &str, n: usize) -> Result<()> {
 pub fn tail_live(cfg: &Config, id: &str) -> Result<()> {
     let mut stream = UnixStream::connect(&cfg.socket_path).context("ttrackd not reachable")?;
     stream.write_all(format!("TAIL {id}\n").as_bytes())?;
-    let mut data = String::new();
-    stream.read_to_string(&mut data)?;
-    if data.starts_with("ERR ") {
-        anyhow::bail!(data.trim().trim_start_matches("ERR ").to_string());
+    let mut buf = [0u8; 8192];
+    let mut first = true;
+    loop {
+        let n = stream.read(&mut buf)?;
+        if n == 0 { break; }
+        if first {
+            first = false;
+            if buf[..n].starts_with(b"ERR ") {
+                let msg = String::from_utf8_lossy(&buf[..n]);
+                anyhow::bail!(msg.trim().trim_start_matches("ERR ").to_string());
+            }
+        }
+        io::stdout().write_all(&buf[..n])?;
+        io::stdout().flush()?;
     }
-    print!("{data}");
     Ok(())
+}
+
+fn scan_session(cfg: &Config, user: &str, path: &Path, needle: &str, insensitive: bool, from: Option<i64>, to: Option<i64>) -> Option<String> {
+    let data = store::read_plain_cast(path, cfg).ok()?;
+    let mut br = BufReader::new(Cursor::new(data));
+    let header = read_header(&mut br).ok()?;
+    if from.map(|f| header.timestamp < f).unwrap_or(false) { return None; }
+    if to.map(|t| header.timestamp > t).unwrap_or(false) { return None; }
+    let cmd_hay = if insensitive { header.command.to_lowercase() } else { header.command.clone() };
+    let cmd_match = cmd_hay.contains(needle);
+    let mut snippets: Vec<String> = Vec::new();
+    let mut output_matched = false;
+    while let Some(ev) = read_event(&mut br).ok()?.or(None) {
+        if ev.1 != "o" { continue; }
+        let hay = if insensitive { ev.2.to_lowercase() } else { ev.2.clone() };
+        if hay.contains(needle) {
+            output_matched = true;
+            for line in ev.2.lines() {
+                let line_hay = if insensitive { line.to_lowercase() } else { line.to_string() };
+                if line_hay.contains(needle) && snippets.len() < 5 {
+                    snippets.push(format!("  > {line}"));
+                }
+            }
+        }
+    }
+    if !cmd_match && !output_matched { return None; }
+    let fname = path.file_name().unwrap().to_string_lossy();
+    let mut out = format!("{user}/{fname}  {}", header.command);
+    for s in snippets {
+        out.push('\n');
+        out.push_str(&s);
+    }
+    Some(out)
 }
 
 pub fn search(cfg: &Config, pattern: &str, user_filter: Option<String>, insensitive: bool, from: Option<i64>, to: Option<i64>) -> Result<()> {
     let needle = if insensitive { pattern.to_lowercase() } else { pattern.to_string() };
+    let mut jobs: Vec<(String, PathBuf)> = Vec::new();
     for user in store::users(cfg)? {
-        if user_filter.as_ref().map(|u| u != &user).unwrap_or(false) {
-            continue;
-        }
+        if user_filter.as_ref().map(|u| u != &user).unwrap_or(false) { continue; }
         for path in store::user_sessions(cfg, &user)? {
-            let data = store::read_plain_cast(&path, cfg)?;
-            let mut br = BufReader::new(Cursor::new(data));
-            let header = read_header(&mut br)?;
-            if from.map(|f| header.timestamp < f).unwrap_or(false) {
-                continue;
-            }
-            if to.map(|t| header.timestamp > t).unwrap_or(false) {
-                continue;
-            }
-            let cmd_match = if insensitive { header.command.to_lowercase().contains(&needle) } else { header.command.contains(&needle) };
-            let mut matched = cmd_match;
-            while let Some(ev) = read_event(&mut br)? {
-                let hay = if insensitive { ev.2.to_lowercase() } else { ev.2.clone() };
-                if hay.contains(&needle) {
-                    matched = true;
-                    break;
+            jobs.push((user.clone(), path));
+        }
+    }
+    let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(jobs.len().max(1));
+    let results: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(vec![None; jobs.len()]));
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, String, PathBuf)>();
+    for (i, (user, path)) in jobs.into_iter().enumerate() {
+        tx.send((i, user, path)).ok();
+    }
+    drop(tx);
+    let rx = Arc::new(Mutex::new(rx));
+    let cfg_arc = Arc::new(cfg.clone());
+    let needle_arc = Arc::new(needle);
+    let mut handles = Vec::new();
+    for _ in 0..n_workers {
+        let rx = rx.clone();
+        let results = results.clone();
+        let cfg = cfg_arc.clone();
+        let needle = needle_arc.clone();
+        let h = std::thread::spawn(move || {
+            loop {
+                let job = rx.lock().unwrap().recv();
+                match job {
+                    Err(_) => break,
+                    Ok((i, user, path)) => {
+                        let r = scan_session(&cfg, &user, &path, &needle, insensitive, from, to);
+                        results.lock().unwrap()[i] = r;
+                    }
                 }
             }
-            if matched {
-                println!("{}/{}  {}", user, path.file_name().unwrap().to_string_lossy(), header.command);
-            }
-        }
+        });
+        handles.push(h);
+    }
+    for h in handles { let _ = h.join(); }
+    let results = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
+    for r in results.into_iter().flatten() {
+        println!("{r}");
     }
     Ok(())
 }

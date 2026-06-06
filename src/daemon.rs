@@ -17,6 +17,33 @@ use std::thread;
 struct LiveSession {
     path: PathBuf,
     uid: u32,
+    subscribers: Vec<std::sync::mpsc::SyncSender<Vec<u8>>>,
+}
+
+struct TeeReader<R: Read> {
+    inner: R,
+    registry: Registry,
+    id: String,
+}
+
+impl<R: Read> Read for TeeReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            let chunk = buf[..n].to_vec();
+            let mut live = self.registry.live.lock().unwrap();
+            if let Some(session) = live.get_mut(&self.id) {
+                session.subscribers.retain(|tx| {
+                    match tx.try_send(chunk.clone()) {
+                        Ok(_) => true,
+                        Err(std::sync::mpsc::TrySendError::Full(_)) => true,
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+                    }
+                });
+            }
+        }
+        Ok(n)
+    }
 }
 
 #[derive(Clone)]
@@ -91,6 +118,8 @@ fn handle(mut conn: UnixStream, cfg: Config, key: Zeroizing<Vec<u8>>, registry: 
             return Ok(());
         }
         handle_tail(conn, cfg, registry, id.trim())
+    } else if let Some(id) = line.strip_prefix("ANSIBLE ") {
+        handle_ansible(br, conn, cfg, key, uid, id.trim())
     } else {
         use std::io::Write;
         conn.write_all(b"ERR unknown command\n")?;
@@ -106,25 +135,55 @@ fn handle_rec<R: Read>(mut input: R, cfg: Config, key: Zeroizing<Vec<u8>>, regis
     let id = format!("{}-{}", chrono::Local::now().format("%Y%m%dT%H%M%S%.9f"), pid);
     let path = dir.join(format!("{id}.cast"));
     let out = File::create(&path).with_context(|| format!("create {}", path.display()))?;
-    registry.live.lock().unwrap().insert(id.clone(), LiveSession { path: path.clone(), uid });
+    registry.live.lock().unwrap().insert(id.clone(), LiveSession { path: path.clone(), uid, subscribers: Vec::new() });
     eprintln!("ttrackd: session started user={user} id={id}");
-    let result = crypto::encrypt_stream(&mut input, out, &key);
+    let mut tee = TeeReader { inner: &mut input, registry: registry.clone(), id: id.clone() };
+    let result = crypto::encrypt_stream(&mut tee, out, &key);
     registry.live.lock().unwrap().remove(&id);
     eprintln!("ttrackd: session closed user={user} id={id}");
     result
 }
 
 fn handle_tail(mut conn: UnixStream, cfg: Config, registry: Registry, id: &str) -> Result<()> {
-    let id = id.trim_end_matches(".cast");
-    let maybe_live = registry.live.lock().unwrap().get(id).map(|s| s.path.clone());
-    let Some(path) = maybe_live else {
-        use std::io::Write;
-        conn.write_all(format!("ERR no active session {id}\n").as_bytes())?;
-        return Ok(());
-    };
-    let data = crate::store::read_plain_cast(&path, &cfg)?;
     use std::io::Write;
+    let id = id.trim_end_matches(".cast");
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+    let maybe_path = {
+        let mut live = registry.live.lock().unwrap();
+        match live.get_mut(id) {
+            None => {
+                conn.write_all(format!("ERR no active session {id}\n").as_bytes())?;
+                return Ok(());
+            }
+            Some(session) => {
+                session.subscribers.push(tx);
+                session.path.clone()
+            }
+        }
+    };
+    let data = crate::store::read_plain_cast(&maybe_path, &cfg)?;
     conn.write_all(&data)?;
+    while let Ok(chunk) = rx.recv() {
+        conn.write_all(&chunk)?;
+    }
+    Ok(())
+}
+
+fn handle_ansible<R: Read>(mut input: R, mut conn: UnixStream, cfg: Config, key: Zeroizing<Vec<u8>>, uid: u32, run_id: &str) -> Result<()> {
+    use std::io::Write;
+    if !crate::ansible::valid_run_id(run_id) {
+        conn.write_all(b"ERR invalid run_id\n")?;
+        return Ok(());
+    }
+    let user = username_for_uid(uid).unwrap_or_else(|| uid.to_string());
+    let dir = cfg.central_dir.join(&user).join("ansible");
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    let path = dir.join(format!("{run_id}.ajsonl"));
+    let out = File::create(&path).with_context(|| format!("create {}", path.display()))?;
+    crypto::encrypt_stream(&mut input, out, &key)?;
+    eprintln!("ttrackd: ansible run stored user={user} id={run_id}");
+    conn.write_all(b"OK\n")?;
     Ok(())
 }
 

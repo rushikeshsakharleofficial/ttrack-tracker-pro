@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use ttrack_pro::ansible;
 use ttrack_pro::audit;
 use ttrack_pro::config::Config;
 use ttrack_pro::crypto;
@@ -71,9 +72,32 @@ enum Commands {
         yes: bool,
     },
     Version,
+    Ansible {
+        #[command(subcommand)]
+        subcmd: AnsibleCmd,
+    },
+    #[command(hide = true, name = "ansible-ingest")]
+    AnsibleIngest,
     #[command(hide = true, name = "__complete")]
     Complete {
         kind: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AnsibleCmd {
+    List {
+        #[arg(long)]
+        user: Option<String>,
+    },
+    Show {
+        #[arg(long)]
+        user: Option<String>,
+        run_id: String,
+    },
+    Incoming {
+        #[arg(long)]
+        user: Option<String>,
     },
 }
 
@@ -128,6 +152,31 @@ fn main() -> Result<()> {
             println!("ttrack-pro {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        Some(Commands::Ansible { subcmd }) => {
+            let cur_user = {
+                let uid = nix::unistd::getuid().as_raw();
+                nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+                    .ok()
+                    .flatten()
+                    .map(|u| u.name)
+                    .unwrap_or_else(|| uid.to_string())
+            };
+            match subcmd {
+                AnsibleCmd::List { user } => {
+                    let user = user.unwrap_or(cur_user);
+                    ansible::cmd_list(&cfg, &user)
+                }
+                AnsibleCmd::Show { user, run_id } => {
+                    let user = user.unwrap_or(cur_user);
+                    ansible::cmd_show(&cfg, &user, &run_id)
+                }
+                AnsibleCmd::Incoming { user } => {
+                    let user = user.unwrap_or(cur_user);
+                    ansible::cmd_incoming(&cfg, &user)
+                }
+            }
+        }
+        Some(Commands::AnsibleIngest) => ansible::cmd_ingest(&cfg),
         Some(Commands::Complete { kind }) => {
             match kind.as_str() {
                 "users" => {
