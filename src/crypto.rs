@@ -21,6 +21,25 @@ pub fn is_encrypted(data: &[u8]) -> bool {
     data.starts_with(MAGIC) || data.starts_with(MAGIC_V1)
 }
 
+pub fn encrypted_sessions_exist(central_dir: &Path) -> bool {
+    let Ok(users) = fs::read_dir(central_dir) else { return false; };
+    for user in users.flatten() {
+        let Ok(ft) = user.file_type() else { continue };
+        if !ft.is_dir() { continue; }
+        let Ok(sessions) = fs::read_dir(user.path()) else { continue };
+        for sess in sessions.flatten() {
+            let p = sess.path();
+            if p.extension().map(|x| x == "cast").unwrap_or(false) {
+                let Ok(header) = fs::read(&p) else { continue };
+                if is_encrypted(&header) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 pub fn ensure_key(path: &Path) -> Result<Vec<u8>> {
     if path.exists() {
         let key = fs::read(path).with_context(|| format!("read key {}", path.display()))?;
@@ -30,6 +49,14 @@ pub fn ensure_key(path: &Path) -> Result<Vec<u8>> {
         return Ok(key);
     }
     if let Some(parent) = path.parent() {
+        if encrypted_sessions_exist(parent) {
+            bail!(
+                "key file {} missing but encrypted sessions exist in {}; \
+                 refusing to create new key (would lose all session data)",
+                path.display(),
+                parent.display()
+            );
+        }
         fs::create_dir_all(parent)?;
     }
     let mut key = vec![0u8; KEY_SIZE];
@@ -40,7 +67,17 @@ pub fn ensure_key(path: &Path) -> Result<Vec<u8>> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
+    set_immutable(path);
     Ok(key)
+}
+
+pub fn set_immutable(path: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("chattr")
+            .args(["+i", &path.to_string_lossy()])
+            .output();
+    }
 }
 
 pub fn encrypt_stream<R: Read, W: Write>(mut r: R, mut w: W, key: &[u8]) -> Result<()> {

@@ -8,6 +8,8 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 pub fn play(cfg: &Config, target: &str, speed: f64) -> Result<()> {
+    let hash_path = crate::auth::playback_hash_path(&cfg.central_dir);
+    crate::auth::verify_password(&hash_path, "Playback password: ", 3)?;
     let path = PathBuf::from(target);
     let data = if path.exists() {
         fs::read(&path)?
@@ -118,7 +120,7 @@ pub fn tail_live(cfg: &Config, id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn search(cfg: &Config, pattern: &str, user_filter: Option<String>, insensitive: bool) -> Result<()> {
+pub fn search(cfg: &Config, pattern: &str, user_filter: Option<String>, insensitive: bool, from: Option<i64>, to: Option<i64>) -> Result<()> {
     let needle = if insensitive { pattern.to_lowercase() } else { pattern.to_string() };
     for user in store::users(cfg)? {
         if user_filter.as_ref().map(|u| u != &user).unwrap_or(false) {
@@ -128,6 +130,12 @@ pub fn search(cfg: &Config, pattern: &str, user_filter: Option<String>, insensit
             let data = store::read_plain_cast(&path, cfg)?;
             let mut br = BufReader::new(Cursor::new(data));
             let header = read_header(&mut br)?;
+            if from.map(|f| header.timestamp < f).unwrap_or(false) {
+                continue;
+            }
+            if to.map(|t| header.timestamp > t).unwrap_or(false) {
+                continue;
+            }
             let cmd_match = if insensitive { header.command.to_lowercase().contains(&needle) } else { header.command.contains(&needle) };
             let mut matched = cmd_match;
             while let Some(ev) = read_event(&mut br)? {
@@ -146,8 +154,20 @@ pub fn search(cfg: &Config, pattern: &str, user_filter: Option<String>, insensit
 }
 
 pub fn prune(cfg: &Config, yes: bool) -> Result<()> {
+    let hash_path = crate::auth::prune_hash_path(&cfg.central_dir);
+    crate::auth::verify_password(&hash_path, "Prune password: ", 3)?;
     if !yes {
-        anyhow::bail!("refusing to prune without --yes in this Rust pro scaffold");
+        let mut total = 0usize;
+        for user in store::users(cfg)? {
+            total += store::user_sessions(cfg, &user)?.len();
+        }
+        eprint!("about to delete {total} session(s). type 'yes' to confirm: ");
+        io::stdout().flush()?;
+        let mut ans = String::new();
+        io::stdin().read_line(&mut ans)?;
+        if ans.trim() != "yes" {
+            anyhow::bail!("prune aborted");
+        }
     }
     let mut count = 0usize;
     for user in store::users(cfg)? {

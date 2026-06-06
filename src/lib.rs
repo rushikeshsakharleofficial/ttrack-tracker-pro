@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod audit;
 pub mod cast;
 pub mod config;

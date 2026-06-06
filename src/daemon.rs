@@ -14,8 +14,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Clone)]
+struct LiveSession {
+    path: PathBuf,
+    uid: u32,
+}
+
+#[derive(Clone)]
 pub struct Registry {
-    live: Arc<Mutex<HashMap<String, PathBuf>>>,
+    live: Arc<Mutex<HashMap<String, LiveSession>>>,
 }
 
 impl Registry {
@@ -28,6 +34,11 @@ pub fn run(cfg: Config) -> Result<()> {
     fs::create_dir_all(&cfg.central_dir).context("create central dir")?;
     fs::set_permissions(&cfg.central_dir, fs::Permissions::from_mode(0o700))?;
     let key: Zeroizing<Vec<u8>> = Zeroizing::new(crypto::ensure_key(&cfg.key_file)?);
+    match crate::store::ingest_local(&cfg, &key) {
+        Ok(n) if n > 0 => eprintln!("ttrackd: ingested {n} local session(s)"),
+        Ok(_) => {}
+        Err(e) => eprintln!("ttrackd: ingest warning: {e:#}"),
+    }
 
     if cfg.socket_path.exists() {
         let _ = fs::remove_file(&cfg.socket_path);
@@ -66,7 +77,8 @@ fn handle(mut conn: UnixStream, cfg: Config, key: Zeroizing<Vec<u8>>, registry: 
     let line = line.trim();
 
     if line == "REC" {
-        if registry.live.lock().unwrap().len() >= cfg.session_cap {
+        let uid_count = registry.live.lock().unwrap().values().filter(|s| s.uid == uid).count();
+        if uid_count >= cfg.session_cap {
             use std::io::Write;
             conn.write_all(b"ERR session cap reached\n")?;
             return Ok(());
@@ -94,7 +106,7 @@ fn handle_rec<R: Read>(mut input: R, cfg: Config, key: Zeroizing<Vec<u8>>, regis
     let id = format!("{}-{}", chrono::Local::now().format("%Y%m%dT%H%M%S%.9f"), pid);
     let path = dir.join(format!("{id}.cast"));
     let out = File::create(&path).with_context(|| format!("create {}", path.display()))?;
-    registry.live.lock().unwrap().insert(id.clone(), path.clone());
+    registry.live.lock().unwrap().insert(id.clone(), LiveSession { path: path.clone(), uid });
     eprintln!("ttrackd: session started user={user} id={id}");
     let result = crypto::encrypt_stream(&mut input, out, &key);
     registry.live.lock().unwrap().remove(&id);
@@ -104,7 +116,7 @@ fn handle_rec<R: Read>(mut input: R, cfg: Config, key: Zeroizing<Vec<u8>>, regis
 
 fn handle_tail(mut conn: UnixStream, cfg: Config, registry: Registry, id: &str) -> Result<()> {
     let id = id.trim_end_matches(".cast");
-    let maybe_live = registry.live.lock().unwrap().get(id).cloned();
+    let maybe_live = registry.live.lock().unwrap().get(id).map(|s| s.path.clone());
     let Some(path) = maybe_live else {
         use std::io::Write;
         conn.write_all(format!("ERR no active session {id}\n").as_bytes())?;

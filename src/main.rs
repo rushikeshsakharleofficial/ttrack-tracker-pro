@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use ttrack_pro::audit;
 use ttrack_pro::config::Config;
+use ttrack_pro::crypto;
 use ttrack_pro::record::{self, RecordOptions};
 use ttrack_pro::store;
 
@@ -48,11 +49,16 @@ enum Commands {
         id: String,
     },
     Tree,
+    Init,
     Search {
         #[arg(short = 'i')]
         insensitive: bool,
         #[arg(long)]
         user: Option<String>,
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        from: Option<String>,
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        to: Option<String>,
         pattern: String,
     },
     Export {
@@ -96,7 +102,22 @@ fn main() -> Result<()> {
             }
         }
         Some(Commands::Tree) => audit::tree(&cfg),
-        Some(Commands::Search { insensitive, user, pattern }) => audit::search(&cfg, &pattern, user, insensitive),
+        Some(Commands::Init) => {
+            std::fs::create_dir_all(&cfg.central_dir).context("create central dir")?;
+            let key = crypto::ensure_key(&cfg.key_file)?;
+            let count = store::ingest_local(&cfg, &key)?;
+            println!("key: {}", cfg.key_file.display());
+            println!("central: {}", cfg.central_dir.display());
+            if count > 0 {
+                println!("ingested {count} local session(s)");
+            }
+            Ok(())
+        }
+        Some(Commands::Search { insensitive, user, from, to, pattern }) => {
+            let from_ts = from.as_deref().map(parse_date).transpose()?;
+            let to_ts = to.as_deref().map(parse_date).transpose()?;
+            audit::search(&cfg, &pattern, user, insensitive, from_ts, to_ts)
+        }
         Some(Commands::Export { out, id }) => audit::export(&cfg, &id, out),
         Some(Commands::Prune { yes }) => audit::prune(&cfg, yes),
         Some(Commands::Version) => {
@@ -108,4 +129,11 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn parse_date(s: &str) -> Result<i64> {
+    use chrono::NaiveDate;
+    let d = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .with_context(|| format!("invalid date '{s}' (expected YYYY-MM-DD)"))?;
+    Ok(d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp())
 }

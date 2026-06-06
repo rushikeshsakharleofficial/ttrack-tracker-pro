@@ -4,8 +4,10 @@ use crate::config::Config;
 use crate::crypto;
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
+use nix::unistd::{Uid, User};
 use std::fs::{self, File};
 use std::io::{BufReader, Cursor};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 pub fn local_dir(cfg: &Config) -> PathBuf {
@@ -46,8 +48,13 @@ pub fn users(cfg: &Config) -> Result<Vec<String>> {
     }
     for entry in fs::read_dir(&cfg.central_dir)? {
         let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            out.push(entry.file_name().to_string_lossy().to_string());
+        let ft = entry.file_type()?;
+        if !ft.is_dir() || ft.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.') {
+            out.push(name);
         }
     }
     out.sort();
@@ -89,6 +96,9 @@ pub fn cast_files(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
+        if entry.file_type()?.is_symlink() {
+            continue;
+        }
         let path = entry.path();
         if path.extension().map(|x| x == "cast").unwrap_or(false) {
             out.push(path);
@@ -96,6 +106,46 @@ pub fn cast_files(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     out.sort();
     Ok(out)
+}
+
+pub fn ingest_local(cfg: &Config, key: &[u8]) -> Result<usize> {
+    let local = local_dir(cfg);
+    if !local.exists() {
+        return Ok(0);
+    }
+    let uid = nix::unistd::getuid().as_raw();
+    let user = User::from_uid(Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|u| u.name)
+        .unwrap_or_else(|| uid.to_string());
+    let dest_dir = cfg.central_dir.join(&user);
+    fs::create_dir_all(&dest_dir)?;
+    fs::set_permissions(&dest_dir, fs::Permissions::from_mode(0o700))?;
+    let mut count = 0usize;
+    for entry in fs::read_dir(&local)? {
+        let entry = entry?;
+        if entry.file_type()?.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if !path.extension().map(|x| x == "cast").unwrap_or(false) {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let dest = dest_dir.join(&name);
+        let data = fs::read(&path)?;
+        if crypto::is_encrypted(&data) {
+            fs::rename(&path, &dest)?;
+        } else {
+            let mut out = Vec::new();
+            crypto::encrypt_stream(Cursor::new(&data), &mut out, key)?;
+            fs::write(&dest, &out)?;
+            fs::remove_file(&path)?;
+        }
+        count += 1;
+    }
+    Ok(count)
 }
 
 pub fn print_session_row(path: &Path, display_name: &str) -> Result<()> {
