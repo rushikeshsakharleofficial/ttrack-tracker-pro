@@ -71,6 +71,10 @@ enum Commands {
         yes: bool,
     },
     Version,
+    #[command(hide = true, name = "__complete")]
+    Complete {
+        kind: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -122,6 +126,39 @@ fn main() -> Result<()> {
         Some(Commands::Prune { yes }) => audit::prune(&cfg, yes),
         Some(Commands::Version) => {
             println!("ttrack-pro {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some(Commands::Complete { kind }) => {
+            match kind.as_str() {
+                "users" => {
+                    for u in store::users(&cfg).unwrap_or_default() {
+                        println!("{u}");
+                    }
+                }
+                "central-sessions" => {
+                    for user in store::users(&cfg).unwrap_or_default() {
+                        for path in store::user_sessions(&cfg, &user).unwrap_or_default() {
+                            if let Some(stem) = path.file_stem() {
+                                println!("{}", stem.to_string_lossy());
+                            }
+                        }
+                    }
+                }
+                "local-sessions" => {
+                    let dir = cfg.local_dir.clone();
+                    if let Ok(entries) = std::fs::read_dir(&dir) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.extension().map(|x| x == "cast").unwrap_or(false) {
+                                if let Some(stem) = p.file_stem() {
+                                    println!("{}", stem.to_string_lossy());
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
             Ok(())
         }
         None => {
