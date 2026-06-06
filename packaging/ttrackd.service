@@ -1,0 +1,12 @@
+[Unit]
+Description=ttrack-pro terminal session audit daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/ttrackd
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
