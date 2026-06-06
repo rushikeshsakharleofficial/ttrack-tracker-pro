@@ -51,7 +51,7 @@ pub fn ls_user(cfg: &Config, user: &str) -> Result<()> {
     println!("STATUS   SESSION                       STARTED              DURATION   COMMAND");
     for path in store::user_sessions(cfg, user)? {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
-        store::print_session_row(&path, &name)?;
+        store::print_session_row(&path, &name, cfg)?;
     }
     Ok(())
 }

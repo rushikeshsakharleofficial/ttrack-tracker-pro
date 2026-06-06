@@ -5,7 +5,7 @@ use crate::crypto;
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
 use nix::unistd::{Uid, User};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{BufReader, Cursor};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -36,7 +36,7 @@ pub fn list_local(cfg: &Config) -> Result<()> {
     }
     println!("STATUS   FILE                          STARTED              DURATION   COMMAND");
     for path in cast_files(&dir)? {
-        print_session_row(&path, &path.file_name().unwrap().to_string_lossy())?;
+        print_session_row(&path, &path.file_name().unwrap().to_string_lossy(), cfg)?;
     }
     Ok(())
 }
@@ -148,9 +148,9 @@ pub fn ingest_local(cfg: &Config, key: &[u8]) -> Result<usize> {
     Ok(count)
 }
 
-pub fn print_session_row(path: &Path, display_name: &str) -> Result<()> {
-    let file = File::open(path)?;
-    let mut br = BufReader::new(file);
+pub fn print_session_row(path: &Path, display_name: &str, cfg: &Config) -> Result<()> {
+    let data = read_plain_cast(path, cfg).unwrap_or_default();
+    let mut br = BufReader::new(Cursor::new(data.clone()));
     let header = read_header(&mut br).ok();
     let started = header
         .as_ref()
@@ -158,14 +158,18 @@ pub fn print_session_row(path: &Path, display_name: &str) -> Result<()> {
         .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_else(|| "?".to_string());
     let command = header.map(|h| h.command).unwrap_or_else(|| "(unreadable)".to_string());
-    let dur = duration(path).unwrap_or_else(|_| "-".to_string());
+    let dur = duration_from_data(&data).unwrap_or_else(|_| "-".to_string());
     println!("{:<8} {:<29} {:<20} {:<10} {}", "SAVED", display_name, started, dur, command);
     Ok(())
 }
 
-pub fn duration(path: &Path) -> Result<String> {
-    let file = File::open(path)?;
-    let mut br = BufReader::new(file);
+pub fn duration(path: &Path, cfg: &Config) -> Result<String> {
+    let data = read_plain_cast(path, cfg)?;
+    duration_from_data(&data)
+}
+
+fn duration_from_data(data: &[u8]) -> Result<String> {
+    let mut br = BufReader::new(Cursor::new(data));
     let _ = read_header(&mut br)?;
     let mut last = 0.0;
     while let Some(ev) = read_event(&mut br)? {
