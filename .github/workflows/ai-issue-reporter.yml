@@ -17,120 +17,138 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Get diff
-        id: diff
+      - name: Collect diff and metadata
         run: |
-          DIFF=$(git diff HEAD~1 HEAD -- '*.rs' '*.toml' '*.sh' '*.yml' | head -c 12000)
-          {
-            echo 'diff<<EOF'
-            echo "$DIFF"
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
+          git diff HEAD~1 HEAD -- '*.rs' '*.toml' '*.sh' '*.yml' \
+            | head -c 12000 > /tmp/diff.txt
+          git log -1 --pretty=%B > /tmp/commit.txt
+          git rev-parse --short HEAD > /tmp/sha.txt
+          echo "Diff size: $(wc -c < /tmp/diff.txt) bytes"
 
-          COMMIT_MSG=$(git log -1 --pretty=%B)
-          echo "commit_msg<<MSGEOF" >> "$GITHUB_OUTPUT"
-          echo "$COMMIT_MSG" >> "$GITHUB_OUTPUT"
-          echo "MSGEOF" >> "$GITHUB_OUTPUT"
-
-          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Analyze with NVIDIA AI
-        id: ai
+      - name: Analyze with NVIDIA NIM
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
-          DIFF='${{ steps.diff.outputs.diff }}'
-          COMMIT='${{ steps.diff.outputs.commit_msg }}'
-          SHA='${{ steps.diff.outputs.sha }}'
+          python3 - <<'PYEOF'
+          import os, json, urllib.request, urllib.error, sys
 
-          # Build prompt
-          PROMPT="You are a senior Rust code reviewer. Analyze this git diff and commit message. Find real bugs, security issues, and correctness problems only. Skip style nits.
+          api_key = os.environ["NVIDIA_API_KEY"]
+          diff    = open("/tmp/diff.txt").read()
+          commit  = open("/tmp/commit.txt").read().strip()
+          sha     = open("/tmp/sha.txt").read().strip()
 
-Commit: $COMMIT
-SHA: $SHA
+          prompt = f"""You are a senior Rust code reviewer. Analyze this git diff and commit message.
+Find real bugs, security issues, and correctness problems only. Skip style nits.
+
+Commit: {commit}
+SHA: {sha}
 
 Diff:
-$DIFF
+{diff}
 
-Respond with a JSON array (no markdown, raw JSON only). Each element:
-{
-  \"title\": \"short issue title (under 70 chars)\",
-  \"body\": \"detailed description with file:line if known, impact, and fix suggestion\",
-  \"labels\": [\"bug\" or \"security\" or \"enhancement\"],
-  \"severity\": \"critical\" | \"high\" | \"medium\"
-}
+Respond with ONLY a raw JSON array — no markdown, no explanation, no code fences.
+Each element has these exact keys:
+  "title"    : short issue title under 70 chars
+  "body"     : detailed description with file:line if known, impact, and fix
+  "labels"   : array containing one of ["bug"], ["security"], or ["enhancement"]
+  "severity" : one of "critical", "high", "medium"
 
-Return [] if no real issues found. Only include issues severity medium or higher."
+Return [] if no issues of medium severity or higher are found."""
 
-          PAYLOAD=$(jq -n \
-            --arg model "nvidia/llama-3.1-nemotron-ultra-253b-v1" \
-            --arg content "$PROMPT" \
-            '{
-              model: $model,
-              messages: [{role: "user", content: $content}],
-              temperature: 0.1,
-              max_tokens: 2048,
-              top_p: 0.7
-            }')
+          payload = json.dumps({
+              "model": "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+              "messages": [{"role": "user", "content": prompt}],
+              "temperature": 0.1,
+              "max_tokens": 2048,
+              "top_p": 0.7,
+          }).encode()
 
-          RESPONSE=$(curl -s -f \
-            -H "Authorization: Bearer $NVIDIA_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD" \
-            "https://integrate.api.nvidia.com/v1/chat/completions")
+          req = urllib.request.Request(
+              "https://integrate.api.nvidia.com/v1/chat/completions",
+              data=payload,
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json",
+              },
+          )
 
-          if [ $? -ne 0 ]; then
-            echo "API call failed"
-            echo "issues=[]" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          try:
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  data = json.loads(resp.read())
+              content = data["choices"][0]["message"]["content"].strip()
+          except Exception as e:
+              print(f"API error: {e}", file=sys.stderr)
+              content = "[]"
 
-          CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "[]"')
+          # Strip markdown fences if model wrapped the JSON
+          if content.startswith("```"):
+              lines = content.splitlines()
+              content = "\n".join(
+                  l for l in lines if not l.startswith("```")
+              ).strip()
 
-          # Extract JSON array from content (strip any surrounding markdown)
-          ISSUES=$(echo "$CONTENT" | grep -o '\[.*\]' | head -1 || echo "[]")
+          try:
+              issues = json.loads(content)
+              if not isinstance(issues, list):
+                  issues = []
+          except Exception:
+              issues = []
 
-          # Validate it's valid JSON array
-          if ! echo "$ISSUES" | jq -e 'type == "array"' > /dev/null 2>&1; then
-            ISSUES="[]"
-          fi
+          with open("/tmp/issues.json", "w") as f:
+              json.dump(issues, f)
 
-          echo "issues<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$ISSUES" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          print(f"Found {len(issues)} issue(s)")
+          PYEOF
 
       - name: Create GitHub issues
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ISSUES: ${{ steps.ai.outputs.issues }}
-          SHA: ${{ steps.diff.outputs.sha }}
         run: |
-          COUNT=$(echo "$ISSUES" | jq 'length')
-          echo "Found $COUNT issue(s) to create"
+          python3 - <<'PYEOF'
+          import json, os, subprocess, sys, time
 
-          if [ "$COUNT" -eq 0 ]; then
-            echo "No issues found — push looks clean."
-            exit 0
-          fi
+          sha    = open("/tmp/sha.txt").read().strip()
+          issues = json.load(open("/tmp/issues.json"))
 
-          for i in $(seq 0 $((COUNT - 1))); do
-            TITLE=$(echo "$ISSUES" | jq -r ".[$i].title")
-            BODY=$(echo "$ISSUES" | jq -r ".[$i].body")
-            SEVERITY=$(echo "$ISSUES" | jq -r ".[$i].severity")
-            LABELS=$(echo "$ISSUES" | jq -r ".[$i].labels[]" | tr '\n' ',' | sed 's/,$//')
+          if not issues:
+              print("No issues — push looks clean.")
+              sys.exit(0)
 
-            FULL_BODY="**Found in commit:** $SHA
+          for issue in issues:
+              title    = issue.get("title", "Untitled")
+              body     = issue.get("body", "")
+              severity = issue.get("severity", "medium")
+              labels   = issue.get("labels", ["bug"])
 
-$BODY
+              full_title = f"[{severity}] {title}"
+              full_body  = f"**Found in commit:** {sha}\n\n{body}\n\n---\n*Auto-generated by AI Issue Reporter*"
 
----
-*Auto-generated by AI Issue Reporter on push to main*"
+              label_args = []
+              for lbl in labels:
+                  label_args += ["--label", lbl]
 
-            gh issue create \
-              --title "[$SEVERITY] $TITLE" \
-              --body "$FULL_BODY" \
-              --label "$LABELS" \
-              || echo "Failed to create issue $i, continuing"
+              cmd = [
+                  "gh", "issue", "create",
+                  "--title", full_title,
+                  "--body", full_body,
+              ] + label_args
 
-            sleep 1
-          done
+              result = subprocess.run(cmd, capture_output=True, text=True)
+              if result.returncode == 0:
+                  print(f"Created: {full_title}")
+                  print(result.stdout.strip())
+              else:
+                  # Label might not exist — retry without labels
+                  cmd_nolabel = [
+                      "gh", "issue", "create",
+                      "--title", full_title,
+                      "--body", full_body,
+                  ]
+                  result2 = subprocess.run(cmd_nolabel, capture_output=True, text=True)
+                  if result2.returncode == 0:
+                      print(f"Created (no label): {full_title}")
+                  else:
+                      print(f"Failed: {result2.stderr}", file=sys.stderr)
+
+              time.sleep(1)
+          PYEOF
