@@ -153,14 +153,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Commands::Ansible { subcmd }) => {
-            let cur_user = {
-                let uid = nix::unistd::getuid().as_raw();
-                nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
-                    .ok()
-                    .flatten()
-                    .map(|u| u.name)
-                    .unwrap_or_else(|| uid.to_string())
-            };
+            let cur_user = store::current_username();
             match subcmd {
                 AnsibleCmd::List { user } => {
                     let user = user.unwrap_or(cur_user);

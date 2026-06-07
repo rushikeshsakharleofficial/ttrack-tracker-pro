@@ -140,7 +140,7 @@ fn scan_session(cfg: &Config, user: &str, path: &Path, needle: &str, insensitive
     let cmd_match = cmd_hay.contains(needle);
     let mut snippets: Vec<String> = Vec::new();
     let mut output_matched = false;
-    while let Some(ev) = read_event(&mut br).ok()?.or(None) {
+    while let Some(ev) = read_event(&mut br).ok()? {
         if ev.1 != "o" { continue; }
         let hay = if insensitive { ev.2.to_lowercase() } else { ev.2.clone() };
         if hay.contains(needle) {

@@ -1,12 +1,13 @@
 use crate::config::Config;
+use crate::crypto;
 use crate::store;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 const MAX_OUTPUT: usize = 8 * 1024;
 
@@ -119,7 +120,9 @@ pub fn parse_run(data: &[u8]) -> Result<ParsedRun> {
             }
             "task" => {
                 let snippet = if ev.stdout.len() > MAX_OUTPUT {
-                    format!("{}...", &ev.stdout[..MAX_OUTPUT])
+                    let mut end = MAX_OUTPUT;
+                    while !ev.stdout.is_char_boundary(end) { end -= 1; }
+                    format!("{}...", &ev.stdout[..end])
                 } else {
                     ev.stdout.clone()
                 };
@@ -151,19 +154,15 @@ pub fn parse_run(data: &[u8]) -> Result<ParsedRun> {
 pub fn valid_run_id(id: &str) -> bool {
     let len = id.len();
     if len < 5 || len > 64 { return false; }
-    id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == 'T')
+    id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
-fn ansible_central_dir(cfg: &Config, user: &str) -> PathBuf {
-    cfg.central_dir.join(user).join("ansible")
-}
-
-fn ansible_local_dir(cfg: &Config) -> PathBuf {
+fn ansible_local_dir(cfg: &Config) -> std::path::PathBuf {
     cfg.local_dir.join("ansible")
 }
 
 fn open_run(cfg: &Config, user: &str, id: &str) -> Result<ParsedRun> {
-    let path = ansible_central_dir(cfg, user).join(format!("{id}.ajsonl"));
+    let path = store::ansible_central_dir(cfg, user).join(format!("{id}.ajsonl"));
     let data = store::read_plain_cast(&path, cfg)?;
     parse_run(&data)
 }
@@ -331,7 +330,10 @@ pub fn cmd_ingest(cfg: &Config) -> Result<()> {
             let local_dir = ansible_local_dir(cfg);
             fs::create_dir_all(&local_dir)?;
             let path = local_dir.join(format!("{run_id}.ajsonl"));
-            fs::write(&path, &data)?;
+            let key = Zeroizing::new(fs::read(&cfg.key_file).context("read key")?);
+            let mut encrypted = Vec::new();
+            crypto::encrypt_stream(Cursor::new(&data), &mut encrypted, &key)?;
+            fs::write(&path, &encrypted)?;
             println!("ansible run {run_id} stored locally (daemon not reachable)");
         }
     }
@@ -342,6 +344,8 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max - 1])
+        let mut end = max.min(s.len());
+        while !s.is_char_boundary(end) { end -= 1; }
+        format!("{}…", &s[..end])
     }
 }

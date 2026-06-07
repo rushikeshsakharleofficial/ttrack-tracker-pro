@@ -2,7 +2,6 @@ use crate::config::Config;
 use crate::crypto;
 use anyhow::{Context, Result};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-use nix::unistd::{Uid, User};
 use zeroize::Zeroizing;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -128,7 +127,7 @@ fn handle(mut conn: UnixStream, cfg: Config, key: Zeroizing<Vec<u8>>, registry: 
 }
 
 fn handle_rec<R: Read>(mut input: R, cfg: Config, key: Zeroizing<Vec<u8>>, registry: Registry, uid: u32, pid: i32) -> Result<()> {
-    let user = username_for_uid(uid).unwrap_or_else(|| uid.to_string());
+    let user = crate::store::username_for_uid(uid).unwrap_or_else(|| uid.to_string());
     let dir = cfg.central_dir.join(&user);
     fs::create_dir_all(&dir)?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
@@ -175,8 +174,8 @@ fn handle_ansible<R: Read>(mut input: R, mut conn: UnixStream, cfg: Config, key:
         conn.write_all(b"ERR invalid run_id\n")?;
         return Ok(());
     }
-    let user = username_for_uid(uid).unwrap_or_else(|| uid.to_string());
-    let dir = cfg.central_dir.join(&user).join("ansible");
+    let user = crate::store::username_for_uid(uid).unwrap_or_else(|| uid.to_string());
+    let dir = crate::store::ansible_central_dir(&cfg, &user);
     fs::create_dir_all(&dir)?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
     let path = dir.join(format!("{run_id}.ajsonl"));
@@ -185,8 +184,4 @@ fn handle_ansible<R: Read>(mut input: R, mut conn: UnixStream, cfg: Config, key:
     eprintln!("ttrackd: ansible run stored user={user} id={run_id}");
     conn.write_all(b"OK\n")?;
     Ok(())
-}
-
-fn username_for_uid(uid: u32) -> Option<String> {
-    User::from_uid(Uid::from_raw(uid)).ok()?.map(|u| u.name)
 }

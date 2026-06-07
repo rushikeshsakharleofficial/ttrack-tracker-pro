@@ -19,6 +19,19 @@ pub fn central_dir(cfg: &Config) -> PathBuf {
     cfg.central_dir.clone()
 }
 
+pub fn ansible_central_dir(cfg: &Config, user: &str) -> PathBuf {
+    cfg.central_dir.join(user).join("ansible")
+}
+
+pub fn username_for_uid(uid: u32) -> Option<String> {
+    User::from_uid(Uid::from_raw(uid)).ok()?.map(|u| u.name)
+}
+
+pub fn current_username() -> String {
+    let uid = nix::unistd::getuid().as_raw();
+    username_for_uid(uid).unwrap_or_else(|| uid.to_string())
+}
+
 pub fn new_local_path(cfg: &Config) -> Result<PathBuf> {
     let dir = local_dir(cfg);
     fs::create_dir_all(&dir)?;
@@ -114,12 +127,7 @@ pub fn ingest_local(cfg: &Config, key: &[u8]) -> Result<usize> {
     if !local.exists() {
         return Ok(0);
     }
-    let uid = nix::unistd::getuid().as_raw();
-    let user = User::from_uid(Uid::from_raw(uid))
-        .ok()
-        .flatten()
-        .map(|u| u.name)
-        .unwrap_or_else(|| uid.to_string());
+    let user = current_username();
     let dest_dir = cfg.central_dir.join(&user);
     fs::create_dir_all(&dest_dir)?;
     fs::set_permissions(&dest_dir, fs::Permissions::from_mode(0o700))?;
@@ -151,7 +159,7 @@ pub fn ingest_local(cfg: &Config, key: &[u8]) -> Result<usize> {
 
 pub fn print_session_row(path: &Path, display_name: &str, cfg: &Config) -> Result<()> {
     let data = read_plain_cast(path, cfg).unwrap_or_default();
-    let mut br = BufReader::new(Cursor::new(data.clone()));
+    let mut br = BufReader::new(Cursor::new(&data[..]));
     let header = read_header(&mut br).ok();
     let started = header
         .as_ref()
@@ -159,14 +167,15 @@ pub fn print_session_row(path: &Path, display_name: &str, cfg: &Config) -> Resul
         .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_else(|| "?".to_string());
     let command = header.as_ref().map(|h| h.command.clone()).unwrap_or_else(|| "(unreadable)".to_string());
-    let active = is_active(path);
+    let session_start = header.as_ref().map(|h| h.timestamp as u64).unwrap_or(0);
+    let active = is_active(path, session_start);
     let (status, dur) = if active {
-        let elapsed = header.as_ref().and_then(|h| {
+        let elapsed = header.as_ref().map(|h| {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            Some(human_duration(now.saturating_sub(h.timestamp as u64) as f64))
+            human_duration(now.saturating_sub(h.timestamp as u64) as f64)
         }).unwrap_or_else(|| "-".to_string());
         ("ACTIVE".to_string(), elapsed)
     } else {
@@ -198,7 +207,7 @@ pub fn header(path: &Path, cfg: &Config) -> Result<crate::cast::Header> {
 }
 
 pub fn ansible_runs(cfg: &Config, user: &str) -> Result<Vec<String>> {
-    let dir = cfg.central_dir.join(user).join("ansible");
+    let dir = ansible_central_dir(cfg, user);
     let mut out = Vec::new();
     if !dir.exists() {
         return Ok(out);
@@ -236,7 +245,7 @@ fn proc_start_time(pid: u32) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn is_active(path: &Path) -> bool {
+pub fn is_active(path: &Path, session_start: u64) -> bool {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     let pid_str = match stem.rsplit_once('-') {
         Some((_, p)) => p,
@@ -257,15 +266,11 @@ pub fn is_active(path: &Path) -> bool {
     let Some(btime) = boot_time() else { return false };
     let Some(starttime) = proc_start_time(pid) else { return false };
     let proc_start = btime + starttime / clk_tck;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    now.abs_diff(proc_start) < 5
+    proc_start.abs_diff(session_start) < 30
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn is_active(_: &Path) -> bool {
+pub fn is_active(_: &Path, _: u64) -> bool {
     false
 }
 
