@@ -25,7 +25,7 @@ jobs:
           git rev-parse --short HEAD > /tmp/sha.txt
           echo "Diff size: $(wc -c < /tmp/diff.txt) bytes"
 
-      - name: Analyze with Kimi K2 (NVIDIA NIM)
+      - name: Analyze with Kimi K2.6 (NVIDIA NIM)
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: python3 .github/scripts/analyze.py

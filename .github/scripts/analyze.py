@@ -39,7 +39,7 @@ prompt = (
 )
 
 payload = json.dumps({
-    "model": "moonshotai/kimi-k2-instruct",
+    "model": "moonshotai/kimi-k2.6",
     "messages": [{"role": "user", "content": prompt}],
     "temperature": 0.1,
     "max_tokens": 2048,
