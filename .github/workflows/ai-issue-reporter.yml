@@ -32,5 +32,5 @@ jobs:
 
       - name: Create GitHub issues
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: python3 .github/scripts/create-issues.py
