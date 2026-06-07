@@ -330,7 +330,7 @@ pub fn cmd_ingest(cfg: &Config) -> Result<()> {
             let local_dir = ansible_local_dir(cfg);
             fs::create_dir_all(&local_dir)?;
             let path = local_dir.join(format!("{run_id}.ajsonl"));
-            let key = Zeroizing::new(fs::read(&cfg.key_file).context("read key")?);
+            let key = Zeroizing::new(fs::read(&cfg.key_file).with_context(|| format!("read key file: {} (hint: run 'ttrack init' to create it)", cfg.key_file.display()))?);
             let mut encrypted = Vec::new();
             crypto::encrypt_stream(Cursor::new(&data), &mut encrypted, &key)?;
             fs::write(&path, &encrypted)?;
